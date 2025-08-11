@@ -1,0 +1,533 @@
+#include <SPI.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SH110X.h>
+#include <Encoder.h>
+#include <avr/pgmspace.h>
+
+// === CONFIGURACIÓN DE PANTALLA OLED ===
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET    -1
+#define WHITE 1 // 1 el valor adecuado para su biblioteca
+#define BLACK 0 // O el valor adecuado para su biblioteca
+//Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+// El constructor es ligeramente diferente, sin el pin de RESET
+Adafruit_SH1106G display = Adafruit_SH1106G(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// === CONFIGURACIÓN DEL ENCODER ROTATORIO ===
+// Usa pines con interrupción si es posible (CLK2 y DT3 en la mayoría de los Arduinos)
+Encoder menuEncoder(3, 2);
+const int ENCODER_BUTTON_PIN = 4; // Pin para el pulsador del encoder (SW)
+
+// === PINES DE SALIDA (J1 - Conector Hembra) ===
+const int OUT1 = 8; // Para Pin 2 (XLR), T (TRS/TS), +1 (NL2/NL4)
+const int OUT2 = 7; // Para Pin 3 (XLR), R (TRS), -1 (NL2/NL4)
+const int OUT3 = 6; // Para Pin 1 (XLR), S (TRS/TS), +2 (NL4)
+const int OUT4 = 5; // Para Pin -2 (NL4)
+int outputs[] = {OUT1, OUT2, OUT3, OUT4};
+
+// === PINES DE ENTRADA (J2 - Conector Macho) ===
+const int IN1 = 9;  // Para Pin 2 (XLR), T (TRS/TS), +1 (NL2/NL4)
+const int IN2 = 10; // Para Pin 3 (XLR), R (TRS), -1 (NL2/NL4)
+const int IN3 = 11; // Para Pin 1 (XLR), S (TRS/TS), +2 (NL4)
+const int IN4 = 12; // Para Pin -1 (NL4)
+int inputs[] = {IN1, IN2, IN3, IN4};
+
+// === PINES DE CONTROL ===
+const int WIGGLE_SWITCH = A0; // Para activar modo WIGGLE Usamos el pin A0 que no tiene conflictos 
+
+// === MATRICES DE RESULTADOS ESPERADOS (0=Continuidad, 1=Abierto) ===
+const int BALANCED[4][4] PROGMEM = { {0, 1, 1, 1}, {1, 0, 1, 1}, {1, 1, 0, 1}, {1, 1, 1, 1} };
+const int MONO[4][4] PROGMEM = { {0, 1, 1, 1}, {1, 1, 1, 1}, {1, 1, 0, 1}, {1, 1, 1, 1} };
+const int NL2[4][4] PROGMEM = { {0, 1, 1, 1}, {1, 0, 1, 1}, {1, 1, 1, 1}, {1, 1, 1, 1} };
+const int NL4[4][4] PROGMEM = { {0, 1, 1, 1}, {1, 0, 1, 1}, {1, 1, 0, 1}, {1, 1, 1, 0} };
+
+// === VARIABLES GLOBALES ===
+const long WIGGLE_INTERVAL = 10000; // 10 segundos
+int operatingMode; // 0 = wiggle, 1 = normal
+int cableTypeIndex = 0; // 0:XLR, 1:TRS, 2:TS, 3:NL2, 4:NL4
+const int NUM_CABLE_TYPES = 6; // Añadido Autotest
+long oldEncoderPosition = -999;
+int pass = 1;
+int lastWiggleState = -1; // <-- AÑADIDA ESTA LÍNEA PARA VISUALIZAR WIGGLE
+
+// ===== FUNCIÓN DE PRESENTACIÓN ANIMADA (VERSIÓN ONDA CORREGIDA) =====
+void showAnimatedSplash() {
+  float phase = 0.0;
+  float amplitude = 16.0;
+  float frequency = 4.0;
+
+  // Bucle de la animación
+  for (int i = 0; i < 180; i++) {
+    display.clearDisplay();
+    
+    // Dibuja la onda sinusoidal
+    for (int x = 0; x < SCREEN_WIDTH; x++) {
+      float y = (SCREEN_HEIGHT / 2) + amplitude * sin(2 * PI * frequency * ((float)x / SCREEN_WIDTH) + phase);
+      display.drawPixel(x, (int)y, WHITE);
+    }
+    
+    // El texto aparece sobre la onda durante la animación
+    display.setTextColor(WHITE); // Es buena práctica definir el color dentro del bucle
+    if (i > 70) {
+      display.setTextSize(2);
+      display.setCursor(2, 2);
+      display.println(F("CABLE TEST"));
+    }
+    if (i > 100) {
+      display.setTextSize(2);
+      display.setCursor(34, 24);
+      display.println(F("@NANO"));
+    }
+    if (i > 125) {
+      display.setTextSize(1);
+      display.setCursor(12, 50);
+      display.println(F("By Nano & GeminiAI"));
+    }
+    display.display();
+    phase += 0.20;
+    delay(10);
+  }
+
+  // ===== LA CORRECCIÓN EMPIEZA AQUÍ =====
+  // Una vez terminada la animación, dibujamos la pantalla final estática.
+  display.clearDisplay(); // Limpiamos la pantalla una última vez.
+
+  // Volvemos a dibujar todo el texto que queremos que permanezca.
+  display.setTextColor(WHITE);
+  display.setTextSize(2);
+  display.setCursor(2, 2);
+  display.println(F("CABLE TEST"));
+  
+  display.setTextSize(2);
+  display.setCursor(34, 24);
+  display.println(F("@NANO"));
+  
+  display.setTextSize(1);
+  display.setCursor(12, 50);
+  display.println(F("By Nano & GeminiAI"));
+  
+  display.display(); // Mostramos el resultado final.
+  
+  delay(1000); // Mantenemos la pantalla final visible.
+}
+
+//====================================================================================
+// ===== SETUP =====
+//====================================================================================
+void setup() {
+  Serial.begin(9600);
+  Serial.println("Iniciando...");
+  Wire.begin(); // Inicializa el bus I2C primero
+
+  if (!display.begin(0x3C, true)) { // El 'true' inicializa el I2C
+    Serial.println(F("Fallo al iniciar SH1106G"));
+    for (;;);
+  }
+  
+  // Limpiar el buffer antes de mostrar cualquier cosa
+  display.clearDisplay();
+  display.display();
+
+  // Mostrar presentación animada
+  showAnimatedSplash();
+  
+  // Configurar pines de ENTRADA de testeo
+  for (int pin : inputs) {
+    pinMode(pin, INPUT_PULLUP);
+  }
+  // Configurar pines de SALIDA de testeo
+  for (int pin : outputs) {
+    pinMode(pin, OUTPUT);
+    digitalWrite(pin, HIGH); // Inicializar en estado HIGH (inactivo)
+  }
+  // Configurar pines de CONTROL
+  pinMode(WIGGLE_SWITCH, INPUT_PULLUP);
+  pinMode(ENCODER_BUTTON_PIN, INPUT_PULLUP);
+
+  // Mostrar pantalla inicial
+  updateMenuDisplay();
+}
+//====================================================================================
+//   LOOP PRINCIPAL
+//====================================================================================
+
+void loop() {
+  // --- Comprobar cambio en el modo WIGGLE ---
+  int currentWiggleState = digitalRead(WIGGLE_SWITCH);
+  if (currentWiggleState != lastWiggleState) {
+    lastWiggleState = currentWiggleState; // Actualiza el estado
+    updateMenuDisplay(); // Redibuja el menú para mostrar el cambio
+  }
+
+	// --- Leer Encoder para selección de menú ---
+  long newEncoderPosition = menuEncoder.read() / 2; // --- Leer Encoder para selección de menú ---
+
+  if (newEncoderPosition != oldEncoderPosition) {
+    oldEncoderPosition = newEncoderPosition;
+	
+	// Lógica para que el menú sea cíclico
+    cableTypeIndex = newEncoderPosition % NUM_CABLE_TYPES;
+    if (cableTypeIndex < 0) {
+      cableTypeIndex += NUM_CABLE_TYPES; // Asegurar que el índice sea positivo
+    }
+    updateMenuDisplay();
+  }
+  
+  // --- Leer Pulsador del Encoder para iniciar el test ---
+  if (!digitalRead(ENCODER_BUTTON_PIN)) {
+    delay(50); // Simple debounce
+    if(!digitalRead(ENCODER_BUTTON_PIN)){
+      if (cableTypeIndex == 5) { // Opción Autotest
+        performSelfTest();
+      } else {
+        operatingMode = digitalRead(WIGGLE_SWITCH) ? 1 : 0; // 1=Normal, 0=Wiggle
+        startTest();
+      }
+      updateMenuDisplay();
+      while(!digitalRead(ENCODER_BUTTON_PIN)); // Esperar a que se suelte el botón
+    }
+  }
+}
+
+// ===== FUNCIONES DE TESTEO =====
+void startTest() {
+  if (operatingMode == 0) {
+    testWiggle();
+  } else {
+    testNormal();
+  }
+}
+
+void testNormal() {
+  int testResults[4][4];
+  performConnectivityTest(testResults);
+  checkResults(testResults, true);
+}
+
+void testWiggle() {
+  unsigned long startMillis = millis();
+  pass = 1;
+  int testResults[4][4];
+  int lastSecond = -1; // <-- NUEVO: Para saber qué segundo mostramos por última vez
+
+
+  display.clearDisplay();
+  display.setTextColor(BLACK, WHITE);
+  display.setCursor(6, 0); // Ajusta la posición si es necesario
+  display.setTextSize(2);
+  display.println(F(" TESTING "));
+  display.setTextColor(WHITE);
+  display.setCursor(10, 17);
+  display.setTextSize(3);
+  display.println(F("WIGGLE"));
+  //display.setCursor(0, 42);
+  //display.setTextSize(2);
+  //display.println(F("por 10 seg"));
+  display.display();
+
+  while (millis() - startMillis < WIGGLE_INTERVAL && pass == 1) {
+    performConnectivityTest(testResults);
+    pass = checkResults(testResults, false);
+
+    // --- LÓGICA DE LA CUENTA ATRÁS ---
+    unsigned long elapsed = millis() - startMillis;
+    int secondsRemaining = (WIGGLE_INTERVAL - elapsed) / 1000;
+
+    // Solo actualiza la pantalla si el segundo ha cambiado
+    if (secondsRemaining != lastSecond) {
+      lastSecond = secondsRemaining; // Actualiza el último segundo mostrado
+
+      // Borra solo el área del número para evitar parpadeos
+      display.fillRect(0, 45, SCREEN_WIDTH, 16, BLACK); 
+      display.setCursor(0, 45);
+      display.setTextSize(2);
+      display.print(F("Queda "));
+      display.print(secondsRemaining); // Muestra los segundos que quedan
+      display.print(F("seg"));
+      display.display(); // Envía el cambio a la pantalla
+    }
+  }
+  
+  checkResults(testResults, true);
+}
+
+void performConnectivityTest(int results[4][4]) {
+  for (int i = 0; i < 4; i++) {
+    digitalWrite(outputs[i], LOW);
+    delay(5);
+    for (int j = 0; j < 4; j++) {
+      results[i][j] = digitalRead(inputs[j]);
+    }
+    digitalWrite(outputs[i], HIGH);
+  }
+}
+
+// ===== FUNCIONES DE RESULTADOS =====
+int checkResults(int pResults[4][4], bool print) {
+  pass = 1;
+  const int (*expectedResults)[4] = nullptr;
+
+  switch (cableTypeIndex) {
+    case 0: case 1: expectedResults = BALANCED; break;
+    case 2: expectedResults = MONO; break;
+    case 3: expectedResults = NL2; break;
+    case 4: expectedResults = NL4; break;
+  }
+  
+  if (expectedResults != nullptr){
+    for (int i = 0; i < 4; i++) {
+      for (int j = 0; j < 4; j++) {
+        if (pResults[i][j] != pgm_read_word(&expectedResults[i][j])) {
+          pass = 0;
+          break;
+        }
+      }
+      if (pass == 0) break;
+    }
+  }
+
+  if (print) {
+    display.clearDisplay();
+    display.setTextSize(3);
+    display.setCursor(28, 21);
+    display.println(pass ? F("PASS") : F("FAIL"));
+    display.display();
+    delay(2000);
+    showDetailedResults(pResults);
+  }
+  return pass;
+}
+
+void showDetailedResults(int pResults[4][4]) {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(18, 0);
+
+  const char* col_headers = "";
+  const char* row_labels[] = {"", "", "", ""};
+
+  switch (cableTypeIndex) {
+    case 0: // XLR
+      col_headers = "2   3   1   /";
+      row_labels[0] = "2:"; row_labels[1] = "3:"; row_labels[2] = "1:"; row_labels[3] = "/:";
+      break;
+    case 1: // TRS
+      col_headers = "T   R   S   /";
+      row_labels[0] = "T:"; row_labels[1] = "R:"; row_labels[2] = "S:"; row_labels[3] = "/:";
+      break;
+    case 2: // TS
+      col_headers = "T   R   S   /";
+      row_labels[0] = "T:"; row_labels[1] = "R:"; row_labels[2] = "S:"; row_labels[3] = "/:";
+      break;
+    case 3: // NL2
+      col_headers = "1+  1-  2+  2-";
+      row_labels[0] = "1+:"; row_labels[1] = "1-:"; row_labels[2] = "2+:"; row_labels[3] = "2-:";
+      break;
+    case 4: // NL4
+      col_headers = "1+  1-  2+  2-";
+      row_labels[0] = "1+:"; row_labels[1] = "1-:"; row_labels[2] = "2+:"; row_labels[3] = "2-:";
+      break;
+  }
+  
+  display.print(col_headers);
+
+  const int (*expected)[4] = nullptr;
+  switch (cableTypeIndex) {
+    case 0: case 1: expected = BALANCED; break;
+    case 2: expected = MONO; break;
+    case 3: expected = NL2; break;
+    case 4: expected = NL4; break;
+  }
+
+  // ===== INICIO DE LA NUEVA LÓGICA =====
+
+  // --- 1ª PASADA: Analizar qué pines están en corto ---
+  bool pinShorted[4] = {false, false, false, false};
+  if (expected) {
+    for (int i = 0; i < 4; i++) {
+      for (int j = 0; j < 4; j++) {
+        bool isShort = (pResults[i][j] == 0 && pgm_read_word(&expected[i][j]) == 1);
+        if (isShort) {
+          pinShorted[i] = true; // El pin de salida 'i' está en corto
+          pinShorted[j] = true; // El pin de entrada 'j' está en corto
+        }
+      }
+    }
+  }
+
+  // --- 2ª PASADA: Dibujar los resultados con la nueva inteligencia ---
+  for (int i = 0; i < 4; i++) {
+    display.setCursor(0, 16 + (i * 12));
+    display.print(row_labels[i]);
+    for (int j = 0; j < 4; j++) {
+      display.setCursor(20 + (j * 24), 16 + (i * 12));
+      if (expected) {
+        int expected_val = pgm_read_word(&expected[i][j]);
+        int actual_val = pResults[i][j];
+
+        if (actual_val == expected_val) {
+          if (actual_val == 0) { // Conexión OK esperada
+            if (pinShorted[i] || pinShorted[j]) {
+              display.print(F("?")); // Es un OK, pero el pin está comprometido
+            } else {
+              display.print(F("OK")); // Un OK limpio
+            }
+          } else { // Conexión abierta esperada
+            display.print(F("."));
+          }
+        } else { // Hay un fallo
+          if (actual_val == 0) { // Cortocircuito
+            display.print(F("X"));
+          } else { // Circuito abierto
+            display.print(F("O"));
+          }
+        }
+      }
+    }
+  }
+  // ===== FIN DE LA NUEVA LÓGICA =====
+
+  display.display();
+  // Corrección para esperar una nueva pulsación para salir
+  delay(500); // Pequeña pausa para no registrar la pulsación inicial
+  while (digitalRead(ENCODER_BUTTON_PIN)) {
+  // Espera a que el botón se presione (estado LOW)
+  }
+  while (!digitalRead(ENCODER_BUTTON_PIN)) {
+  // Espera a que el botón se suelte (estado HIGH)
+ }
+}
+
+// ===== FUNCIÓN AUTOTEST =====
+void performSelfTest() {
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setCursor(10, 16);
+  display.println(F("Auto-Test"));
+  display.setTextSize(1);
+  
+  bool allOK = true;
+  
+  // 1. Test de salidas
+  display.setCursor(0, 32);
+  display.print(F("Outputs: "));
+  for (int i = 0; i < 4; i++) {
+    pinMode(outputs[i], OUTPUT);
+    digitalWrite(outputs[i], LOW);
+    delay(50);
+    int val = digitalRead(outputs[i]);
+    digitalWrite(outputs[i], HIGH);
+    if (val != LOW) {
+      allOK = false;
+      display.print("FAIL");
+      break;
+    }
+  }
+  if (allOK) display.print("OK");
+  
+  // 2. Test de entradas
+  display.setCursor(0, 42);
+  display.print("Inputs: ");
+  for (int i = 0; i < 4; i++) {
+    pinMode(inputs[i], INPUT_PULLUP);
+    delay(50);
+    if (digitalRead(inputs[i]) != HIGH) {
+      allOK = false;
+      display.print("FAIL");
+      break;
+    }
+  }
+  if (allOK) display.print("OK");
+  
+  // 3. Test de controles
+  display.setCursor(0, 51);
+  display.print("Controls: ");
+  if (digitalRead(ENCODER_BUTTON_PIN) != HIGH || digitalRead(WIGGLE_SWITCH) != HIGH) {
+    allOK = false;
+    display.print("FAIL");
+  } else {
+    display.print("OK");
+  }
+  
+  // Resultado final
+  display.setTextSize(2);
+  display.setCursor(40, 0);
+  display.println(allOK ? "PASS" : "FAIL");
+  display.display();
+  
+  while (digitalRead(ENCODER_BUTTON_PIN));
+  while (!digitalRead(ENCODER_BUTTON_PIN));
+}
+
+// ===== FUNCIÓN DE MENÚ =====
+void updateMenuDisplay() {
+  display.clearDisplay();
+  display.setTextSize(3);
+  
+  switch (cableTypeIndex) {
+    case 0: // XLR
+      display.setTextSize(4);
+      display.setCursor(30, 16);
+      display.println(F("XLR"));
+      display.setTextSize(2);
+      display.setCursor(18, 47);
+      display.println(F("Balanced"));
+      break;
+    case 1: // TRS
+      display.setTextSize(4);
+      display.setCursor(30, 16);
+      display.println(F("TRS"));
+      display.setTextSize(2);
+      display.setCursor(18, 47);
+      display.println(F("Balanced"));
+      break;
+    case 2: // TS
+      display.setTextSize(4);
+      display.setCursor(40, 16);
+      display.println(F("TS"));
+      display.setTextSize(2);
+      display.setCursor(5, 47);
+      display.println(F("Unbalanced"));
+      break;
+    case 3: // NL2
+      display.setTextSize(3);
+      display.setCursor(1, 16);
+      display.println(F("Speakon"));
+      display.setTextSize(2);
+      display.setCursor(45, 47);
+      display.println(F("NL2"));
+      break;
+    case 4: // NL4
+      display.setTextSize(3);
+      display.setCursor(1, 16);
+      display.println(F("Speakon"));
+      display.setTextSize(2);
+      display.setCursor(45, 47);
+      display.println(F("NL4"));
+      break;
+    case 5: // AUTOTEST
+      display.setTextSize(3);
+      display.setCursor(26, 17);
+      display.println(F("AUTO"));
+      display.setCursor(38, 47);
+      display.setTextSize(2);
+      display.println(F("TEST"));
+      break;
+  }
+  // ===== INICIO DEL CÓDIGO A AÑADIR =====
+  // Indicador de modo WIGGLE en la esquina superior derecha
+  if (digitalRead(WIGGLE_SWITCH) == LOW) {
+    display.setTextSize(2);
+    display.setCursor(1, 1); // Ajusta la posición si es necesario
+    display.print(F("Mod WIGGLE"));
+   } else {
+    display.setTextSize(2);
+    display.setCursor(1, 1); // Ajusta la posición si es necesario  
+    display.print(F("Mod NORMAL"));
+  }
+  // ===== FIN DEL CÓDIGO A AÑADIR =====
+
+  display.display();  
+}
