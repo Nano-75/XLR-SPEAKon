@@ -106,7 +106,7 @@ void showAnimatedSplash() {
   
   display.setTextSize(1);
   display.setCursor(12, 50);
-  display.println(F("By Nano & GeminiAI"));
+  display.println(F("By Nano & Ver. 8.1"));
   
   display.display(); // Mostramos el resultado final.
   
