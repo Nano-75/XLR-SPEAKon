@@ -233,8 +233,6 @@ void testWiggle() {
   //display.setTextSize(2);
   //display.println(F("por 10 seg"));
   display.display();
-  Serial.print(F("RAM WIGGLE libre: "));
-  Serial.println(freeMemory());
 
   while (millis() - startMillis < WIGGLE_INTERVAL && pass == 1) {
     performConnectivityTest(testResults);
@@ -256,8 +254,6 @@ void testWiggle() {
       display.print(secondsRemaining); // Muestra los segundos que quedan
       display.print(F("seg"));
       display.display(); // Envía el cambio a la pantalla
-      Serial.print(F("RAM Cuenta libre: "));
-      Serial.println(freeMemory());
     }
   }
   
